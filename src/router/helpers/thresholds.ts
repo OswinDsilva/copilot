@@ -1,0 +1,35 @@
+/**
+ * Confidence thresholds for routing decisions
+ */
+
+export const THRESHOLDS = {
+  // High confidence - use immediately
+  VERY_HIGH: 0.9,
+  HIGH: 0.7,
+  
+  // Medium confidence - use with caution
+  MEDIUM: 0.6,
+  MEDIUM_LOW: 0.5,
+  
+  // Low confidence - fallback or LLM
+  LOW: 0.4,
+  
+  // Bypass thresholds
+  DETERMINISTIC_BYPASS: 0.65,
+  SQL_BYPASS: 0.5,
+} as const;
+
+export const PRIORITY_THRESHOLDS = {
+  EQUIPMENT_OPTIMIZATION: THRESHOLDS.MEDIUM,
+  EQUIPMENT_COMBINATION: THRESHOLDS.MEDIUM,
+  VISUALIZATION: THRESHOLDS.MEDIUM,
+  AGGREGATION: THRESHOLDS.MEDIUM,
+  SHIFT_SPECIFIC: THRESHOLDS.MEDIUM,
+  DATE_RANGE: THRESHOLDS.MEDIUM,
+  SPECIFIC_PRODUCTION: THRESHOLDS.MEDIUM,  // Lowered from HIGH to MEDIUM
+  MONTHLY_SUMMARY: THRESHOLDS.MEDIUM,  // Lowered from HIGH to MEDIUM
+  KPI_SUMMARY: THRESHOLDS.HIGH,
+  ADVISORY: THRESHOLDS.HIGH,
+  PRODUCTION_SUMMARY: THRESHOLDS.MEDIUM,
+  DATA_RETRIEVAL: THRESHOLDS.MEDIUM_LOW,
+} as const;

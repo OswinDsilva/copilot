@@ -1,0 +1,1100 @@
+/**
+ * SQL Builder - Single Source of Truth for SQL Generation
+ * 
+ * This module consolidates all deterministic SQL generation logic.
+ * It takes intent + parameters and generates SQL without calling the LLM.
+ * 
+ * Flow:
+ * 1. Router detects intent and extracts parameters
+ * 2. SQL Builder uses intent + params to generate SQL
+ * 3. If SQL Builder returns null, fall back to LLM generation
+ * 
+ * REFACTORED: Builders now organized into modular files
+ * - builders/comparison.ts: Comparison queries
+ * - builders/ranking.ts: Equipment ranking, ordinal queries, top/bottom
+ * - builders/monthly.ts: Monthly summaries and month comparisons
+ * - builders/shifts.ts: Shift aggregations and comparisons
+ * - builders/equipment.ts: Equipment combinations and specific equipment
+ * - builders/production.ts: Production queries, trip counts, routes/faces, heatmaps
+ * 
+ * All shared logic extracted to helpers/
+ */
+
+// Import builder functions from modular files
+import { buildComparisonSQL } from './builders/comparison';
+import { 
+  buildEquipmentRankingSQL, 
+  buildOrdinalRowSQL, 
+  buildTopBottomShiftsSQL,
+  buildTopProductionDaysSQL 
+} from './builders/ranking';
+import { 
+  buildMonthlySummarySQL, 
+  buildAggregationSummarySQL,
+  buildMonthComparisonSQL 
+} from './builders/monthly';
+import { 
+  buildShiftAggregationSQL,
+  buildShiftSpecificSQL 
+} from './builders/shifts';
+import { 
+  buildEquipmentCombinationSQL,
+  buildEquipmentSpecificProductionSQL 
+} from './builders/equipment';
+import { 
+  buildGenericDateQuery,
+  buildDateRangeAggregationSQL,
+  buildTripCountAggregationSQL,
+  buildRoutesFacesAnalysisSQL,
+  buildHeatmapSQL 
+} from './builders/production';
+
+/**
+ * Main SQL builder function
+ * Takes intent classification and parameters, returns SQL or null
+ */
+export function buildSQL(
+  intent: string,
+  params: Record<string, any>,
+  question: string
+): string | null {
+  
+  // Route to specific SQL builders based on intent
+  switch (intent) {
+    case 'COMPARISON_QUERY':
+      return buildComparisonSQL(params, question);
+    
+    case 'ORDINAL_ROW_QUERY':
+      return buildOrdinalRowSQL(params, question);
+    
+    case 'EQUIPMENT_COMBINATION':
+      return buildEquipmentCombinationSQL(params, question);
+    
+    case 'EQUIPMENT_SPECIFIC_PRODUCTION':
+      return buildEquipmentSpecificProductionSQL(params, question)
+        || (params.date || params.date_start || params.date_end ? buildGenericDateQuery(params) : null);
+    
+    case 'MONTHLY_SUMMARY':
+      return buildMonthlySummarySQL(params, question)
+        || buildTopProductionDaysSQL(params, question)
+        || buildShiftAggregationSQL(params, question)
+        || (params.date || params.date_start || params.date_end ? buildGenericDateQuery(params) : null);
+    
+    case 'AGGREGATION_QUERY':
+      // Try shift aggregation first if query mentions shifts
+      if (/\bshift/i.test(question)) {
+        const shiftSQL = buildShiftAggregationSQL(params, question);
+        if (shiftSQL) return shiftSQL;
+      }
+      
+      // Try other aggregation patterns
+      return buildMonthComparisonSQL(params, question)
+        || buildTopProductionDaysSQL(params, question)
+        || buildTripCountAggregationSQL(params, question)
+        || buildShiftAggregationSQL(params, question)
+        || buildAggregationSummarySQL(params, question)
+        || buildTopBottomShiftsSQL(params);
+    
+    case 'MONTH_COMPARISON':
+      return buildMonthComparisonSQL(params, question);
+    
+    case 'DATE_RANGE_QUERY':
+      // Check for equipment ranking queries first
+      const equipmentRankingSQL = buildEquipmentRankingSQL(params, question);
+      if (equipmentRankingSQL) return equipmentRankingSQL;
+      
+      // Check for trip count queries
+      return buildTopProductionDaysSQL(params, question)
+        || buildTripCountAggregationSQL(params, question)
+        || buildMonthComparisonSQL(params, question)
+        || buildShiftAggregationSQL(params, question)
+        || buildGenericDateQuery(params);
+    
+    case 'DATA_RETRIEVAL':
+      // Check for equipment ranking queries first
+      const equipRankSQL = buildEquipmentRankingSQL(params, question);
+      if (equipRankSQL) return equipRankSQL;
+      
+      // Check for month comparison first
+      const monthCompSQL = buildMonthComparisonSQL(params, question);
+      if (monthCompSQL) return monthCompSQL;
+      
+      // Check for top/bottom date queries (e.g., "which date had most trips")
+      const topDateSQL = buildTopProductionDaysSQL(params, question);
+      if (topDateSQL) return topDateSQL;
+      
+      // Try data retrieval patterns
+      if (params.shift && params.shift.length > 0) {
+        return buildShiftSpecificSQL(params);
+      }
+      if (params.date_range) {
+        return buildDateRangeAggregationSQL(params);
+      }
+      // Handle specific date or date range queries
+      if (params.date || params.date_start || params.date_end) {
+        return buildGenericDateQuery(params);
+      }
+      return null;
+    
+    // Intents that don't need SQL building
+    case 'EQUIPMENT_OPTIMIZATION':
+    case 'FORECASTING':
+    case 'ADVISORY_QUERY':
+      return null;
+    
+    case 'ROUTES_FACES_ANALYSIS':
+      return buildRoutesFacesAnalysisSQL(params, question);
+    
+    case 'CHART_VISUALIZATION':
+      // Check for heatmap requests (need 2 dimensions)
+      const heatmapSQL = buildHeatmapSQL(params, question);
+      if (heatmapSQL) return heatmapSQL;
+      
+      // Check for equipment ranking/distribution charts
+      const equipmentChartSQL = buildEquipmentRankingSQL(params, question);
+      if (equipmentChartSQL) return equipmentChartSQL;
+      
+      // Check if it's a month-based chart
+      return buildMonthComparisonSQL(params, question)
+        || buildShiftAggregationSQL(params, question)
+        || null;
+    
+    default:
+      // Unknown intent - let LLM handle it
+      return null;
+  }
+}
+  if (!params.comparison) return null;
+  
+  const { entity1, entity2 } = params.comparison;
+  const comparisonType = params.comparison_type;
+  
+  // Determine metric being compared
+  const isTrips = /\b(trips?|trip count)\b/i.test(query);
+  const isProductivity = /\b(productive|productivity|efficiency|efficient)\b/i.test(query);
+  
+  // Default metric
+  let metricColumn = 'qty_ton';
+  let metricAlias = 'total_tonnage';
+  let table = 'production_summary';
+  let dateColumn = 'date';
+  
+  if (isTrips) {
+    metricColumn = 'trip_count';
+    metricAlias = 'total_trips';
+    table = 'trip_summary_by_date';
+    dateColumn = 'trip_date';
+  } else if (isProductivity) {
+    // Productivity = trips per day
+    metricColumn = 'trip_count';
+    metricAlias = 'trips_per_day';
+    table = 'trip_summary_by_date';
+    dateColumn = 'trip_date';
+  }
+  
+  const year = params.year || getCurrentYear();
+  
+  // Build SQL based on comparison type
+  if (comparisonType === 'month') {
+    // Month comparison: "Did may have higher production or january"
+    const month1 = extractMonthNumber(entity1);
+    const month2 = extractMonthNumber(entity2);
+    
+    if (!month1 || !month2) return null;
+    
+    if (isProductivity) {
+      // Calculate trips per day for each month
+      return `SELECT 
+        CASE EXTRACT(MONTH FROM ${dateColumn})
+          WHEN ${month1} THEN '${entity1}'
+          WHEN ${month2} THEN '${entity2}'
+        END AS month,
+        ROUND(SUM(${metricColumn}) * 1.0 / COUNT(DISTINCT ${dateColumn}), 2) AS ${metricAlias}
+      FROM ${table}
+      WHERE EXTRACT(MONTH FROM ${dateColumn}) IN (${month1}, ${month2})
+        AND EXTRACT(YEAR FROM ${dateColumn}) = ${year}
+      GROUP BY EXTRACT(MONTH FROM ${dateColumn})
+      ORDER BY ${metricAlias} DESC`;
+    }
+    
+    return `SELECT 
+      CASE EXTRACT(MONTH FROM ${dateColumn})
+        WHEN ${month1} THEN '${entity1}'
+        WHEN ${month2} THEN '${entity2}'
+      END AS month,
+      SUM(${metricColumn}) AS ${metricAlias}
+    FROM ${table}
+    WHERE EXTRACT(MONTH FROM ${dateColumn}) IN (${month1}, ${month2})
+      AND EXTRACT(YEAR FROM ${dateColumn}) = ${year}
+    GROUP BY EXTRACT(MONTH FROM ${dateColumn})
+    ORDER BY ${metricAlias} DESC`;
+  }
+  
+  if (comparisonType === 'shift') {
+    // Shift comparison: "Is shift A more productive or shift B"
+    const shift1 = entity1.toUpperCase().replace('SHIFT ', '');
+    const shift2 = entity2.toUpperCase().replace('SHIFT ', '');
+    
+    // Date filter
+    let dateFilter = '';
+    if (params.date) {
+      dateFilter = `AND ${dateColumn} = '${params.date}'`;
+    } else if (params.month) {
+      dateFilter = `AND EXTRACT(MONTH FROM ${dateColumn}) = ${params.month} AND EXTRACT(YEAR FROM ${dateColumn}) = ${year}`;
+    } else if (params.date_start && params.date_end) {
+      dateFilter = `AND ${dateColumn} BETWEEN '${params.date_start}' AND '${params.date_end}'`;
+    } else {
+      // Default to current year if no date specified
+      dateFilter = `AND EXTRACT(YEAR FROM ${dateColumn}) = ${year}`;
+    }
+    
+    if (isProductivity) {
+      return `SELECT 
+        shift,
+        ROUND(SUM(${metricColumn}) * 1.0 / COUNT(DISTINCT ${dateColumn}), 2) AS ${metricAlias}
+      FROM ${table}
+      WHERE shift IN ('${shift1}', '${shift2}') ${dateFilter}
+      GROUP BY shift
+      ORDER BY ${metricAlias} DESC`;
+    }
+    
+    return `SELECT 
+      shift,
+      SUM(${metricColumn}) AS ${metricAlias}
+    FROM ${table}
+    WHERE shift IN ('${shift1}', '${shift2}') ${dateFilter}
+    GROUP BY shift
+    ORDER BY ${metricAlias} DESC`;
+  }
+  
+  if (comparisonType === 'equipment') {
+    // Equipment comparison: "Did BB-53 make higher trips today or BB-43"
+    const equip1 = entity1.toUpperCase();
+    const equip2 = entity2.toUpperCase();
+    
+    // Force trip_summary_by_date for equipment queries
+    table = 'trip_summary_by_date';
+    dateColumn = 'trip_date';
+    
+    // Determine equipment column
+    const isTipper = /^(BB-|DT-)/.test(equip1) || /^(BB-|DT-)/.test(equip2);
+    const equipColumn = isTipper ? 'tipper_id' : 'excavator';
+    
+    // Date filter
+    let dateFilter = '';
+    if (params.date) {
+      dateFilter = `AND ${dateColumn} = '${params.date}'`;
+    } else if (params.month) {
+      dateFilter = `AND EXTRACT(MONTH FROM ${dateColumn}) = ${params.month} AND EXTRACT(YEAR FROM ${dateColumn}) = ${year}`;
+    } else if (params.date_start && params.date_end) {
+      dateFilter = `AND ${dateColumn} BETWEEN '${params.date_start}' AND '${params.date_end}'`;
+    }
+    
+    if (isProductivity) {
+      return `SELECT 
+        ${equipColumn},
+        ROUND(SUM(trip_count) * 1.0 / COUNT(DISTINCT ${dateColumn}), 2) AS trips_per_day
+      FROM ${table}
+      WHERE ${equipColumn} IN ('${equip1}', '${equip2}') ${dateFilter}
+      GROUP BY ${equipColumn}
+      ORDER BY trips_per_day DESC`;
+    }
+    
+    return `SELECT 
+      ${equipColumn},
+      SUM(trip_count) AS total_trips
+    FROM ${table}
+    WHERE ${equipColumn} IN ('${equip1}', '${equip2}') ${dateFilter}
+    GROUP BY ${equipColumn}
+    ORDER BY total_trips DESC`;
+  }
+  
+  if (comparisonType === 'date') {
+    // Date comparison: "Did 2025-01-15 have higher production than 2025-01-20"
+    return `SELECT 
+      ${dateColumn} AS date,
+      SUM(${metricColumn}) AS ${metricAlias}
+    FROM ${table}
+    WHERE ${dateColumn} IN ('${entity1}', '${entity2}')
+    GROUP BY ${dateColumn}
+    ORDER BY ${metricAlias} DESC`;
+  }
+  
+  // Fallback: return null to let LLM handle it
+  return null;
+}
+
+/**
+ * Build SQL for equipment ranking queries (tipper/excavator with most trips/tonnage/production)
+ * 
+ * NOTE: trip_summary_by_date has equipment IDs but NO tonnage column (only trip_count)
+ *       production_summary has tonnage but NO equipment IDs (only counts)
+ *       For tonnage queries, we can only give aggregate data, not per-equipment
+ */
+function buildEquipmentRankingSQL(params: Record<string, any>, query: string): string | null {
+  // Match ranking patterns for trips
+  const isTipperRanking = /\b(tipper|dumper).*\b(most|highest|maximum|max)\s+trips/i.test(query);
+  const isExcavatorRanking = /\bexcavator.*\b(most|highest|maximum|max)\s+trips/i.test(query);
+  
+  // Match ranking patterns for tonnage/production
+  const isTipperTonnageRanking = /\b(tipper|dumper).*\b(most|highest|maximum|max|top|total)\s+(tonnage|ton|production|qty)/i.test(query);
+  const isExcavatorTonnageRanking = /\bexcavator.*\b(most|highest|maximum|max|top|total)\s+(tonnage|ton|production|qty)/i.test(query);
+  
+  // Match "top N excavators/tippers by tonnage/production"
+  const isTopExcavatorsByMetric = /\btop\s+\d+\s+excavators?\s+by\s+(tonnage|ton|production|qty|trips)/i.test(query);
+  const isTopTippersByMetric = /\btop\s+\d+\s+(tippers?|dumpers?)\s+by\s+(tonnage|ton|production|qty|trips)/i.test(query);
+  
+  // Match grouping patterns (by tipper, by excavator)
+  const isTipperGrouping = /\btrips?\s+by\s+(tipper|dumper)/i.test(query) || /\b(tipper|dumper).*\btrips?\b/i.test(query);
+  const isExcavatorGrouping = /\btrips?\s+by\s+excavator/i.test(query) || /\bexcavator.*\btrips?\b/i.test(query);
+  
+  if (!isTipperRanking && !isExcavatorRanking && !isTipperTonnageRanking && !isExcavatorTonnageRanking 
+      && !isTopExcavatorsByMetric && !isTopTippersByMetric && !isTipperGrouping && !isExcavatorGrouping) {
+    return null;
+  }
+  
+  // Determine which equipment type
+  const isTipperQuery = isTipperRanking || isTipperTonnageRanking || isTopTippersByMetric || isTipperGrouping;
+  const groupColumn = isTipperQuery ? 'tipper_id' : 'excavator';
+  
+  // Determine which metric (tonnage vs trips)
+  // CRITICAL: trip_summary_by_date doesn't have qty_ton, only trip_count
+  const isTonnageQuery = isTipperTonnageRanking || isExcavatorTonnageRanking || isTopExcavatorsByMetric || isTopTippersByMetric;
+  
+  // For tonnage queries, we can't use trip_summary_by_date - return null to fall back to LLM
+  // which will explain the limitation or use production_summary for aggregate data
+  if (isTonnageQuery) {
+    return null;
+  }
+  
+  const metricColumn = 'trip_count';
+  const metricAlias = 'total_trips';
+  
+  const monthNum = params.month || extractMonthNumber(query);
+  const year = params.year || getCurrentYear();
+  
+  // Check if asking for single top result or multiple (for charts, return all)
+  const isChart = /\b(chart|graph|plot|pie)\b/i.test(query);
+  
+  // Extract limit from query (e.g., "top 5", "top 10")
+  const topMatch = query.match(/\btop\s+(\d+)/i);
+  const limitFromQuery = topMatch ? parseInt(topMatch[1]) : null;
+  
+  const limit = isChart ? 20 : limitFromQuery || (/\bthe\s+(tipper|excavator)\b/i.test(query) ? 1 : 10);
+  
+  let dateFilter = '';
+  if (monthNum) {
+    dateFilter = `WHERE EXTRACT(MONTH FROM trip_date) = ${monthNum} AND EXTRACT(YEAR FROM trip_date) = ${year}`;
+  } else if (params.date) {
+    dateFilter = `WHERE trip_date = '${params.date}'`;
+  } else if (params.date_start && params.date_end) {
+    dateFilter = `WHERE trip_date BETWEEN '${params.date_start}' AND '${params.date_end}'`;
+  } else if (params.quarter) {
+    // Handle quarter filtering (Q1 = months 1-3, Q2 = 4-6, Q3 = 7-9, Q4 = 10-12)
+    const quarterStart = (params.quarter - 1) * 3 + 1;
+    const quarterEnd = params.quarter * 3;
+    dateFilter = `WHERE EXTRACT(MONTH FROM trip_date) BETWEEN ${quarterStart} AND ${quarterEnd} AND EXTRACT(YEAR FROM trip_date) = ${year}`;
+  }
+  
+  return `SELECT ${groupColumn}, SUM(${metricColumn}) AS ${metricAlias} FROM trip_summary_by_date ${dateFilter} GROUP BY ${groupColumn} ORDER BY ${metricAlias} DESC LIMIT ${limit}`;
+}
+
+/**
+ * Build SQL for ordinal row queries (e.g., "select 19th row")
+ */
+function buildOrdinalRowSQL(params: Record<string, any>, query: string): string | null {
+  // Delegate equipment ranking to dedicated function
+  const equipmentRankSQL = buildEquipmentRankingSQL(params, query);
+  if (equipmentRankSQL) return equipmentRankSQL;
+  
+  if (!params.row_number) return null;
+  
+  const rawTable = query.match(PATTERNS.TABLE_NAME)?.[1]?.trim() || '';
+  const normalized = rawTable ? rawTable.toLowerCase().replace(/[^a-z0-9]+/g, '_') : '';
+  const allowed = new Set(['production_summary', 'trip_summary_by_date', 'uploaded_files', 'equipment']);
+  
+  if (!normalized || !allowed.has(normalized)) return null;
+  
+  const offset = Math.max(0, params.row_number - 1);
+  // Use appropriate sort column for each table (with quotes for case-sensitive columns)
+  const sortColumn = normalized === 'trip_summary_by_date' ? 'trip_date' : 
+                    normalized === 'production_summary' ? '"date"' : 
+                    'id';
+  return `SELECT * FROM ${normalized} ORDER BY ${sortColumn} ASC LIMIT 1 OFFSET ${offset}`;
+}
+
+/**
+ * Build SQL for equipment combination queries (tipper + excavator pairs)
+ */
+function buildEquipmentCombinationSQL(params: Record<string, any>, question?: string): string | null {
+  // Handle "which tippers/excavators" queries - single equipment type ranking
+  if (question) {
+    // Check for productivity/efficiency queries for combos
+    const isProductivityCombo = /(most|highest|best)\s+(productive|efficient|effective).*\b(combo|combination|pair)/i.test(question) ||
+                                /\b(combo|combination|pair).*\b(most|highest|best)\s+(productive|efficient|effective)/i.test(question);
+    
+    if (isProductivityCombo) {
+      const monthNum = params.month || extractMonthNumber(question);
+      const year = params.year || getCurrentYear();
+      const limit = params.n || 10;
+      
+      let dateFilter = '';
+      if (monthNum) {
+        dateFilter = `WHERE EXTRACT(MONTH FROM trip_date) = ${monthNum} AND EXTRACT(YEAR FROM trip_date) = ${year}`;
+      } else if (params.date) {
+        dateFilter = `WHERE trip_date = '${params.date}'`;
+      } else if (params.date_start && params.date_end) {
+        dateFilter = `WHERE trip_date BETWEEN '${params.date_start}' AND '${params.date_end}'`;
+      }
+      
+      // Productivity = total trips / number of days worked (trips per day)
+      const whereClause = dateFilter || '';
+      return `SELECT 
+        tipper_id, 
+        excavator, 
+        SUM(trip_count) AS total_trips,
+        COUNT(DISTINCT trip_date) AS days_worked,
+        ROUND(SUM(trip_count) * 1.0 / COUNT(DISTINCT trip_date), 2) AS trips_per_day
+      FROM trip_summary_by_date 
+      ${whereClause}
+      GROUP BY tipper_id, excavator 
+      HAVING COUNT(DISTINCT trip_date) >= 2
+      ORDER BY trips_per_day DESC 
+      LIMIT ${limit}`;
+    }
+    
+    const isTipperRanking = /which\s+(tippers?|dumpers?)\s+(made|had|did).*most\s+trips/i.test(question);
+    const isExcavatorRanking = /which\s+excavators?\s+(made|had|did).*most\s+trips/i.test(question);
+    
+    if (isTipperRanking || isExcavatorRanking) {
+      const groupColumn = isTipperRanking ? 'tipper_id' : 'excavator';
+      const monthNum = params.month || extractMonthNumber(question);
+      const year = params.year || getCurrentYear();
+      const limit = params.n || 10;
+      
+      let dateFilter = '';
+      if (monthNum) {
+        dateFilter = `WHERE EXTRACT(MONTH FROM trip_date) = ${monthNum} AND EXTRACT(YEAR FROM trip_date) = ${year}`;
+      } else if (params.date) {
+        dateFilter = `WHERE trip_date = '${params.date}'`;
+      } else if (params.date_start && params.date_end) {
+        dateFilter = `WHERE trip_date BETWEEN '${params.date_start}' AND '${params.date_end}'`;
+      }
+      
+      return `SELECT ${groupColumn}, SUM(trip_count) AS total_trips FROM trip_summary_by_date ${dateFilter} GROUP BY ${groupColumn} ORDER BY total_trips DESC LIMIT ${limit}`;
+    }
+  }
+  
+  // Handle both equipment combinations AND single equipment type queries (e.g., "which tippers")
+  // CHANGE: Allow generic queries without specific machine IDs (e.g., "show all combinations")
+  // Removed the check for params.machines/machine_types - we now handle all combination queries
+  
+  // CRITICAL: If query mentions actual "production" metrics, return null to let LLM handle it
+  // Production queries need qty_ton and qty_m3, not just trip counts
+  // BUT "productive" is okay - we handle it with trips per day
+  if (question && /\b(production|tonnage|cubic|qty_ton|qty_m3|tons?|m3)\b/i.test(question) && 
+      !/\bproductive\b/i.test(question)) {
+    return null;
+  }
+  
+  const limit = params.n || 10;
+  let dateFilter = '';
+  let shiftFilter = '';
+  
+  if (params.date) {
+    dateFilter = `WHERE trip_date = '${params.date}'`;
+  } else if (params.month) {
+    const year = params.year || getCurrentYear();
+    dateFilter = `WHERE EXTRACT(MONTH FROM trip_date) = ${params.month} AND EXTRACT(YEAR FROM trip_date) = ${year}`;
+  } else if (params.date_start && params.date_end) {
+    dateFilter = `WHERE trip_date BETWEEN '${params.date_start}' AND '${params.date_end}'`;
+  }
+  
+  // Add shift filter if specified
+  if (params.shift && params.shift.length > 0) {
+    const shifts = params.shift.map((s: string) => `'${s}'`).join(', ');
+    shiftFilter = dateFilter ? ` AND shift IN (${shifts})` : `WHERE shift IN (${shifts})`;
+  }
+  
+  // Check if asking for "most trips" or similar superlatives (aggregate across all dates/shifts)
+  const isMostTrips = question && /(most|highest|top|best|maximum).*trips?|(trips?).*\b(most|highest|top|best|maximum)\b/i.test(question);
+  
+  if (isMostTrips) {
+    // Aggregate total trips across all dates and shifts for each combo
+    return `SELECT tipper_id, excavator, SUM(trip_count) AS total_trips FROM trip_summary_by_date ${dateFilter}${shiftFilter} GROUP BY tipper_id, excavator ORDER BY total_trips DESC LIMIT ${limit}`;
+  }
+  
+  // Default: show detailed breakdown by shift and date
+  return `SELECT tipper_id, excavator, shift, trip_date, SUM(trip_count) AS total_trips FROM trip_summary_by_date ${dateFilter}${shiftFilter} GROUP BY tipper_id, excavator, shift, trip_date ORDER BY total_trips DESC LIMIT ${limit}`;
+}
+
+/**
+ * Build SQL for top/bottom N shifts queries
+ */
+function buildTopBottomShiftsSQL(params: Record<string, any>): string | null {
+  if (!params.rank_type || !params.n) return null;
+  
+  const isBottom = params.rank_type === 'bottom';
+  const orderDir = isBottom ? 'ASC' : 'DESC';
+  const limit = params.n || 10;
+  const dateFilter = buildDateFilter(params);
+  
+  return `SELECT date, shift, qty_ton, total_trips FROM production_summary ${dateFilter} ORDER BY qty_ton ${orderDir} LIMIT ${limit}`;
+}
+
+/**
+ * Build SQL for shift-specific queries
+ */
+function buildShiftSpecificSQL(params: Record<string, any>): string | null {
+  if (!params.shift || params.shift.length === 0) return null;
+  
+  const dateFilter = buildDateFilter(params);
+  const shiftFilter = buildShiftFilter(params, !!dateFilter);
+  
+  // production_summary columns: date, shift, qty_ton, qty_m3, target_ton, target_m3
+  return `SELECT date, shift, qty_ton, qty_m3 FROM production_summary ${dateFilter} ${shiftFilter} ORDER BY date, shift`;
+}
+
+/**
+ * Build generic SQL for date-based queries (fallback for specific dates)
+ */
+function buildGenericDateQuery(params: Record<string, any>): string | null {
+  const dateFilter = buildDateFilter(params);
+  if (!dateFilter) return null;
+  
+  const shiftFilter = buildShiftFilter(params, true);
+  // production_summary columns: date, shift, qty_ton, qty_m3, target_ton, target_m3
+  return `SELECT date, shift, qty_ton, qty_m3 FROM production_summary ${dateFilter}${shiftFilter} ORDER BY date, shift`;
+}
+
+/**
+ * Build SQL for date range aggregation queries
+ */
+function buildDateRangeAggregationSQL(params: Record<string, any>): string | null {
+  if (!params.date_range) return null;
+  
+  const dateFilter = buildDateFilter(params);
+  const shiftFilter = buildShiftFilter(params, !!dateFilter);
+  
+  // production_summary columns: date, shift, qty_ton, qty_m3 (no total_trips column)
+  return `SELECT date, shift, SUM(qty_ton) AS total_tonnage, SUM(qty_m3) AS total_cubic_meters FROM production_summary ${dateFilter}${shiftFilter} GROUP BY date, shift ORDER BY date DESC`;
+}
+
+/**
+ * Build SQL for aggregation summary queries (monthly totals with equipment)
+ */
+function buildAggregationSummarySQL(params: Record<string, any>, query: string): string | null {
+  const monthNum = params.month || extractMonthNumber(query);
+  if (!monthNum) return null;
+  
+  const year = getCurrentYear();
+  
+  // production_summary columns: date, shift, qty_ton, qty_m3, target_ton, target_m3 (no total_trips, excavator, dumper)
+  let sql = `SELECT 
+    SUM(qty_ton) AS total_tonnage,
+    SUM(qty_m3) AS total_cubic_meters,
+    AVG(qty_ton) AS avg_daily_tonnage,
+    COUNT(DISTINCT date) AS production_days`;
+  
+  // Note: equipment utilization data not available in production_summary
+  // Equipment data is in trip_summary_by_date (tipper_id, excavator)
+  
+  sql += `
+  FROM production_summary
+  WHERE EXTRACT(MONTH FROM date) = ${monthNum} AND EXTRACT(YEAR FROM date) = ${year}`;
+  
+  return sql;
+}
+
+/**
+ * Build SQL for monthly summary queries
+ */
+function buildMonthlySummarySQL(params: Record<string, any>, query: string): string | null {
+  const monthNum = params.month || extractMonthNumber(query);
+  if (!monthNum) return null;
+  
+  // Don't generate monthly summary if it's a specific date query (has both month AND date)
+  if (params.date && params.parsed_date?.type === 'single') return null;
+  
+  // Don't generate monthly summary if it's a top/bottom query
+  const isTopBottom = /top|highest|best|bottom|lowest|worst/i.test(query);
+  if (isTopBottom) return null;
+  
+  // Don't generate monthly summary if it's a shift comparison
+  const isShiftComparison = /compare.*shift|by\s+shift|shift\s+comparison|per\s+shift/i.test(query);
+  if (isShiftComparison) return null;
+  
+  const year = params.year || getCurrentYear();
+  const shiftFilter = buildShiftFilter(params, true);
+  
+  // Check if user asks for trips or equipment utilization
+  const needsTrips = /\b(trip|trips|trip[_ ]count)\b/i.test(query);
+  const needsEquipment = /\b(equipment|utilization|excavator|tipper|dumper|machine|vehicle)\b/i.test(query);
+  
+  // If user asks for trips or equipment, need subqueries (NOT JOIN to avoid duplication)
+  if (needsTrips || needsEquipment) {
+    // Use column aliases with AS for cleaner output
+    let sql = `SELECT 
+    (SELECT SUM(qty_ton) FROM production_summary WHERE EXTRACT(MONTH FROM date) = ${monthNum} AND EXTRACT(YEAR FROM date) = ${year}${shiftFilter}) AS total_tonnage,
+    (SELECT SUM(qty_m3) FROM production_summary WHERE EXTRACT(MONTH FROM date) = ${monthNum} AND EXTRACT(YEAR FROM date) = ${year}${shiftFilter}) AS total_cubic_meters,
+    (SELECT COUNT(DISTINCT date) FROM production_summary WHERE EXTRACT(MONTH FROM date) = ${monthNum} AND EXTRACT(YEAR FROM date) = ${year}${shiftFilter}) AS production_days`;
+    
+    if (needsTrips) {
+      sql += `,\n    (SELECT SUM(trip_count) FROM trip_summary_by_date WHERE EXTRACT(MONTH FROM trip_date) = ${monthNum} AND EXTRACT(YEAR FROM trip_date) = ${year}${shiftFilter.replace(/date/g, 'trip_date')}) AS total_trips`;
+    }
+    
+    if (needsEquipment) {
+      sql += `,\n    (SELECT COUNT(DISTINCT tipper_id) FROM trip_summary_by_date WHERE EXTRACT(MONTH FROM trip_date) = ${monthNum} AND EXTRACT(YEAR FROM trip_date) = ${year}${shiftFilter.replace(/date/g, 'trip_date')}) AS unique_tippers,\n    (SELECT COUNT(DISTINCT excavator) FROM trip_summary_by_date WHERE EXTRACT(MONTH FROM trip_date) = ${monthNum} AND EXTRACT(YEAR FROM trip_date) = ${year}${shiftFilter.replace(/date/g, 'trip_date')}) AS unique_excavators`;
+    }
+    
+    return sql;
+  }
+  
+  // Simple production summary without trips/equipment
+  return `SELECT 
+    SUM(qty_ton) AS total_tonnage,
+    SUM(qty_m3) AS total_cubic_meters,
+    AVG(qty_ton) AS avg_daily_tonnage,
+    MAX(qty_ton) AS max_daily_tonnage,
+    MIN(qty_ton) AS min_daily_tonnage,
+    COUNT(DISTINCT date) AS production_days
+  FROM production_summary
+  WHERE EXTRACT(MONTH FROM date) = ${monthNum} AND EXTRACT(YEAR FROM date) = ${year}${shiftFilter}`;
+}
+
+/**
+ * Build SQL for top/bottom production days in a time period
+ */
+function buildTopProductionDaysSQL(params: Record<string, any>, query: string): string | null {
+  // Check if asking for top/bottom/highest/lowest production days or dates
+  const isTopBottom = /top|highest|best|bottom|lowest|worst|most|least/i.test(query);
+  if (!isTopBottom) return null;
+  
+  const isBottom = /bottom|lowest|worst|least/i.test(query);
+  const limit = params.n || 5;
+  
+  const dateFilter = buildDateFilter(params);
+  if (!dateFilter) return null;
+  
+  // Check if asking for specific columns or metrics
+  const wantsM3 = /m3|cubic\s*meters?|volume/i.test(query);
+  const wantsTrips = /trips?/i.test(query);
+  const wantsDate = /\b(which|what)\s+(date|day)\b/i.test(query);
+  
+  // If asking for trips specifically, use trip_summary_by_date table
+  if (wantsTrips) {
+    const orderDir = isBottom ? 'ASC' : 'DESC';
+    const dateCol = 'trip_date';
+    const tripFilter = dateFilter.replace(/\bdate\b/g, dateCol);
+    
+    // Aggregate trips by date
+    return `SELECT ${dateCol} AS date, SUM(trip_count) AS total_trips 
+FROM trip_summary_by_date 
+${tripFilter} 
+GROUP BY ${dateCol} 
+ORDER BY total_trips ${orderDir} 
+LIMIT ${wantsDate ? 1 : limit}`;
+  }
+  
+  // For tonnage/volume queries
+  let columns = 'date, qty_ton';
+  if (wantsM3) columns += ', qty_m3';
+  
+  const orderDir = isBottom ? 'ASC' : 'DESC';
+  const orderByCol = wantsM3 ? 'qty_m3' : 'qty_ton';
+  
+  return `SELECT ${columns} FROM production_summary ${dateFilter} ORDER BY ${orderByCol} ${orderDir} LIMIT ${wantsDate ? 1 : limit}`;
+}
+
+/**
+ * Build SQL for shift aggregation/comparison queries
+ */
+function buildShiftAggregationSQL(params: Record<string, any>, query: string): string | null {
+  // Check if asking to compare shifts or aggregate by shift
+  const isShiftComparison = /compare.*shift|by\s+shift|shift\s+comparison|per\s+shift/i.test(query);
+  
+  // Check if asking for highest/lowest/best/worst shift (superlative queries)
+  const isShiftSuperlative = /(highest|lowest|best|worst|most|least|top|bottom).*shift|shift.*(highest|lowest|best|worst|most|least)/i.test(query);
+  
+  if (!isShiftComparison && !isShiftSuperlative) return null;
+  
+  const dateFilter = buildDateFilter(params);
+  // For shift superlatives without date filter, aggregate across all available data
+  if (!dateFilter && !isShiftSuperlative) return null;
+  
+  // Check what metrics are requested
+  const wantsAverage = /average|avg|mean/i.test(query);
+  const wantsTotal = /total|sum/i.test(query);
+  const wantsTrips = /trips?/i.test(query);
+  
+  let selectClauses = ['shift'];
+  let orderByColumn = 'total_tonnage';
+  
+  // Always include totals (for ordering), but label them appropriately
+  if (wantsTotal || wantsAverage) {
+    selectClauses.push('SUM(qty_ton) AS total_tonnage');
+    if (wantsTrips) selectClauses.push('SUM(total_trips) AS total_trips');
+  } else {
+    // Default: just totals
+    selectClauses.push('SUM(qty_ton) AS total_tonnage');
+    if (wantsTrips) selectClauses.push('SUM(total_trips) AS total_trips');
+  }
+  
+  if (wantsAverage) {
+    selectClauses.push('AVG(qty_ton) AS avg_tonnage');
+    if (wantsTrips) selectClauses.push('AVG(total_trips) AS avg_trips');
+  }
+  
+  selectClauses.push('COUNT(DISTINCT date) AS production_days');
+  
+  // For superlative queries asking for "the shift" (singular), limit to 1
+  const isSingularSuperlative = isShiftSuperlative && /\b(the|which)\s+shift\b/i.test(query);
+  const limitClause = isSingularSuperlative ? ' LIMIT 1' : '';
+  
+  // Determine sort direction (DESC for highest/best/most, ASC for lowest/worst/least)
+  const isAscending = /(lowest|worst|least|bottom)/i.test(query);
+  const sortDirection = isAscending ? 'ASC' : 'DESC';
+  
+  return `SELECT ${selectClauses.join(', ')} FROM production_summary ${dateFilter ? dateFilter : ''} GROUP BY shift ORDER BY ${orderByColumn} ${sortDirection}${limitClause}`;
+}
+
+/**
+ * Build SQL for equipment-specific production queries (by equipment ID)
+ */
+function buildEquipmentSpecificProductionSQL(params: Record<string, any>, query: string): string | null {
+  const equipmentIds = params.equipment_ids;
+  if (!equipmentIds || equipmentIds.length === 0) return null;
+  
+  // Detect equipment type from query or equipment ID pattern
+  const isTipper = /\b(tipper|dumper|BB-\d+|DT-\d+)\b/i.test(query) || 
+                   (equipmentIds[0] && /^(BB-|DT-)/i.test(equipmentIds[0]));
+  const isExcavator = /\b(excavator|EX-\d+)\b/i.test(query) || 
+                      (equipmentIds[0] && /^EX-/i.test(equipmentIds[0]));
+  
+  // Determine what metric is being requested
+  const isTrips = /\b(trips?|trip count)\b/i.test(query);
+  const isTonnage = /\b(tonnage|tons?|production)\b/i.test(query);
+  const isWorkedWith = /\b(worked with|partnered with|paired with)\b/i.test(query);
+  const isHowMany = /\bhow many\b/i.test(query);
+  
+  // CRITICAL: trip_summary_by_date uses trip_date column, NOT date
+  // Build date filter manually with correct column name
+  let dateFilter = '';
+  const monthNum = params.month || extractMonthNumber(query);
+  const year = params.year || getCurrentYear();
+  
+  if (params.date) {
+    dateFilter = `WHERE trip_date = '${params.date}'`;
+  } else if (params.date_start && params.date_end) {
+    dateFilter = `WHERE trip_date BETWEEN '${params.date_start}' AND '${params.date_end}'`;
+  } else if (monthNum) {
+    const lastDay = new Date(year, monthNum, 0).getDate();
+    const startDate = `${year}-${String(monthNum).padStart(2, '0')}-01`;
+    const endDate = `${year}-${String(monthNum).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`;
+    dateFilter = `WHERE trip_date BETWEEN '${startDate}' AND '${endDate}'`;
+  } else if (params.year) {
+    dateFilter = `WHERE EXTRACT(YEAR FROM trip_date) = ${year}`;
+  }
+  
+  // Add shift filtering if present
+  const shiftFilter = buildShiftFilter(params, !!dateFilter);
+  
+  // Combine filters
+  let whereClause = '';
+  if (dateFilter) whereClause = dateFilter;
+  if (shiftFilter) {
+    whereClause = whereClause ? `${whereClause} ${shiftFilter}` : `WHERE ${shiftFilter.replace('AND ', '')}`;
+  }
+  
+  // Handle tipper-specific queries
+  if (isTipper) {
+    const tipperFilter = equipmentIds.length === 1
+      ? `tipper_id = '${equipmentIds[0]}'`
+      : `tipper_id IN (${equipmentIds.map((id: string) => `'${id}'`).join(', ')})`;
+    
+    whereClause = whereClause 
+      ? `${whereClause} AND ${tipperFilter}`
+      : `WHERE ${tipperFilter}`;
+    
+    // "How many excavators did BB-53 work with"
+    if (isHowMany && (isWorkedWith || /excavator/i.test(query))) {
+      return `SELECT COUNT(DISTINCT excavator) AS count FROM trip_summary_by_date ${whereClause}`;
+    }
+    
+    // "How many trips did BB-53 make"
+    if (isTrips || isHowMany) {
+      return `SELECT tipper_id, SUM(trip_count) AS total_trips, COUNT(DISTINCT trip_date) AS active_days FROM trip_summary_by_date ${whereClause} GROUP BY tipper_id`;
+    }
+    
+    // Default: show details
+    return `SELECT tipper_id, excavator, SUM(trip_count) AS total_trips FROM trip_summary_by_date ${whereClause} GROUP BY tipper_id, excavator ORDER BY total_trips DESC`;
+  }
+  
+  // Handle excavator-specific queries
+  if (isExcavator) {
+    const excavatorFilter = equipmentIds.length === 1
+      ? `excavator = '${equipmentIds[0]}'`
+      : `excavator IN (${equipmentIds.map((id: string) => `'${id}'`).join(', ')})`;
+    
+    whereClause = whereClause 
+      ? `${whereClause} AND ${excavatorFilter}`
+      : `WHERE ${excavatorFilter}`;
+    
+    // "How many tippers has EX-141 worked with"
+    if (isHowMany && (isWorkedWith || /tipper|dumper/i.test(query))) {
+      return `SELECT COUNT(DISTINCT tipper_id) AS count FROM trip_summary_by_date ${whereClause}`;
+    }
+    
+    // "How many trips did EX-141 make"
+    if (isTrips || isHowMany) {
+      return `SELECT excavator, SUM(trip_count) AS total_trips, COUNT(DISTINCT trip_date) AS active_days FROM trip_summary_by_date ${whereClause} GROUP BY excavator`;
+    }
+    
+    // Default: show details
+    return `SELECT excavator, tipper_id, SUM(trip_count) AS total_trips FROM trip_summary_by_date ${whereClause} GROUP BY excavator, tipper_id ORDER BY total_trips DESC`;
+  }
+  
+  // Fallback to original logic for backward compatibility
+  const equipmentFilter = equipmentIds.length === 1
+    ? `WHERE excavator = '${equipmentIds[0]}'`
+    : `WHERE excavator IN (${equipmentIds.map((id: string) => `'${id}'`).join(', ')})`;
+  
+  const combinedFilter = dateFilter 
+    ? `${equipmentFilter} AND ${dateFilter.replace('WHERE ', '')}`
+    : equipmentFilter;
+  
+  const finalFilter = shiftFilter 
+    ? `${combinedFilter} ${shiftFilter}`
+    : combinedFilter;
+  
+  // If asking for trips specifically, sum trip_count
+  if (isTrips && !isTonnage) {
+    return `SELECT 
+      excavator,
+      SUM(trip_count) AS total_trips,
+      COUNT(DISTINCT trip_date) AS active_days
+    FROM trip_summary_by_date
+    ${finalFilter}
+    GROUP BY excavator
+    ORDER BY total_trips DESC`;
+  }
+  
+  // For tonnage/production, we need to estimate or join
+  // Since trip_summary_by_date doesn't have tonnage, we'll calculate estimated tonnage
+  return `SELECT 
+    excavator,
+    SUM(trip_count) AS total_trips,
+    ROUND(SUM(trip_count * 15.0), 2) AS estimated_tonnage,
+    COUNT(DISTINCT trip_date) AS active_days,
+    ROUND(AVG(trip_count), 2) AS avg_trips_per_day
+  FROM trip_summary_by_date
+  ${finalFilter}
+  GROUP BY excavator
+  ORDER BY total_trips DESC`;
+}
+
+/**
+ * Build SQL for trip count aggregation queries
+ */
+function buildTripCountAggregationSQL(params: Record<string, any>, query: string): string | null {
+  // Check for total/sum queries with tonnage, m3, or trips
+  const hasTotalTonnage = /\b(total|sum).*\b(tonnage|qty_ton|tons?)\b/i.test(query);
+  const hasTotalM3 = /\b(total|sum).*\b(m3|cubic\s*meters?|qty_m3)\b/i.test(query);
+  const hasTripKeyword = /\b(trip count|trips|trip_count|total trips)\b/i.test(query);
+  
+  // Handle total m3 queries
+  if (hasTotalM3 && !hasTripKeyword) {
+    const monthNum = params.month || extractMonthNumber(query);
+    const year = params.year || getCurrentYear();
+    
+    // Build WHERE clause
+    let whereConditions: string[] = [];
+    
+    if (monthNum) {
+      whereConditions.push(`EXTRACT(MONTH FROM date) = ${monthNum}`);
+      whereConditions.push(`EXTRACT(YEAR FROM date) = ${year}`);
+    }
+    
+    // Add shift filter if present
+    if (params.shift && params.shift.length > 0) {
+      const shifts = params.shift.map((s: string) => `'${s}'`).join(', ');
+      whereConditions.push(`shift IN (${shifts})`);
+    }
+    
+    if (whereConditions.length > 0) {
+      return `SELECT SUM(qty_m3) AS total_m3 FROM production_summary WHERE ${whereConditions.join(' AND ')}`;
+    }
+  }
+  
+  // Handle total tonnage queries
+  if (hasTotalTonnage && !hasTripKeyword) {
+    const monthNum = params.month || extractMonthNumber(query);
+    const year = params.year || getCurrentYear();
+    
+    // Build WHERE clause
+    let whereConditions: string[] = [];
+    
+    if (monthNum) {
+      whereConditions.push(`EXTRACT(MONTH FROM date) = ${monthNum}`);
+      whereConditions.push(`EXTRACT(YEAR FROM date) = ${year}`);
+    }
+    
+    // Add shift filter if present
+    if (params.shift && params.shift.length > 0) {
+      const shifts = params.shift.map((s: string) => `'${s}'`).join(', ');
+      whereConditions.push(`shift IN (${shifts})`);
+    }
+    
+    if (whereConditions.length > 0) {
+      return `SELECT SUM(qty_ton) AS total_tonnage FROM production_summary WHERE ${whereConditions.join(' AND ')}`;
+    }
+  }
+  
+  // Handle trip count queries
+  if (!hasTripKeyword) return null;
+  
+  const monthNum = params.month || extractMonthNumber(query);
+  const year = params.year || getCurrentYear();
+  
+  // If month specified, aggregate for that month
+  if (monthNum) {
+    return `SELECT SUM(trip_count) FROM trip_summary_by_date WHERE EXTRACT(MONTH FROM trip_date) = ${monthNum} AND EXTRACT(YEAR FROM trip_date) = ${year}`;
+  }
+  
+  // If date range specified
+  if (params.date_start && params.date_end) {
+    return `SELECT SUM(trip_count) FROM trip_summary_by_date WHERE trip_date >= '${params.date_start}' AND trip_date <= '${params.date_end}'`;
+  }
+  
+  // If specific date
+  if (params.date) {
+    return `SELECT SUM(trip_count) FROM trip_summary_by_date WHERE trip_date = '${params.date}'`;
+  }
+  
+  return null;
+}
+
+/**
+ * Build SQL for routes/faces analysis queries
+ */
+function buildRoutesFacesAnalysisSQL(params: Record<string, any>, query: string): string | null {
+  const monthNum = params.month || extractMonthNumber(query);
+  const year = params.year || getCurrentYear();
+  const limit = params.n || 20;
+  
+  let dateFilter = '';
+  if (monthNum) {
+    dateFilter = `WHERE EXTRACT(MONTH FROM trip_date) = ${monthNum} AND EXTRACT(YEAR FROM trip_date) = ${year}`;
+  } else if (params.date) {
+    dateFilter = `WHERE trip_date = '${params.date}'`;
+  } else if (params.date_start && params.date_end) {
+    dateFilter = `WHERE trip_date BETWEEN '${params.date_start}' AND '${params.date_end}'`;
+  }
+  
+  // Order by total_trips (actual trip count) not usage_count (date+shift combinations)
+  return `SELECT route_or_face, SUM(trip_count) AS total_trips FROM trip_summary_by_date ${dateFilter} GROUP BY route_or_face ORDER BY total_trips DESC LIMIT ${limit}`;
+}
+
+/**
+ * Build SQL for month comparison queries (e.g., "which month had the highest production")
+ */
+function buildMonthComparisonSQL(params: Record<string, any>, query: string): string | null {
+  // Trigger for queries asking about months with superlatives OR ordering OR "by month"
+  const hasMonthReference = /\b(which|what|select|show|find|get|all|chart|graph).*\bmonths?\b/i.test(query) || 
+                            /\bmonths?\b.*(with|had|has|by)/i.test(query) ||
+                            /\bby\s+months?\b/i.test(query);
+  const hasSuperlative = /\b(highest|most|best|lowest|least|worst|maximum|minimum|max|min|top|bottom|higest|lowst)\b/i.test(query);
+  const hasOrdering = /\b(order|sort|rank|arrange).*\b(by|descending|ascending|desc|asc)\b/i.test(query) ||
+                      /\b(descending|ascending|desc|asc)\b/i.test(query);
+  const hasByMonth = /\bby\s+months?\b/i.test(query);
+  
+  const isMonthComparison = hasMonthReference && (hasSuperlative || hasOrdering || hasByMonth);
+  
+  if (!isMonthComparison) return null;
+  
+  // Determine metric - check for trip count queries
+  const hasTripCount = /\b(trip count|trips|trip_count|total trips|number of trips)\b/i.test(query);
+  const metric = hasTripCount ? 'trip_count' : 'qty_ton';
+  
+  // Select table based on metric
+  // trip_count is in trip_summary_by_date, qty_ton is in production_summary
+  const table = hasTripCount ? 'trip_summary_by_date' : 'production_summary';
+  const dateColumn = hasTripCount ? 'trip_date' : 'date';
+  
+  // Determine ordering (DESC for highest/most/best/max/descending, ASC for lowest/least/worst/min/ascending)
+  const isLowest = /\b(lowest|least|worst|minimum|min|bottom|ascending|asc)\b/i.test(query);
+  const order = isLowest ? 'ASC' : 'DESC';
+  
+  // Determine limit (default to all months for charts, otherwise 1 for specific comparisons)
+  const hasAll = /\ball\s+months?\b/i.test(query);
+  const isChart = /\b(chart|graph|plot|visuali[sz]e)\b/i.test(query);
+  const limitMatch = query.match(/\b(\d+)\s+months?\b/i) || query.match(/\btop\s+(\d+)\b/i);
+  const limit = hasAll || isChart ? 12 : (limitMatch ? parseInt(limitMatch[1]) : 1);
+  
+  // Year filter (default to current year if not specified)
+  const year = params.year || getCurrentYear();
+  
+  // For charts, order chronologically (by month number)
+  // For comparisons (highest/lowest), order by value (sum)
+  const orderByClause = isChart ? 'ORDER BY 1' : `ORDER BY 3 ${order}`;
+  
+  // Use CASE to convert month number to name (avoid TO_CHAR which triggers AS errors)
+  return `SELECT EXTRACT(MONTH FROM ${dateColumn}), CASE EXTRACT(MONTH FROM ${dateColumn}) WHEN 1 THEN 'January' WHEN 2 THEN 'February' WHEN 3 THEN 'March' WHEN 4 THEN 'April' WHEN 5 THEN 'May' WHEN 6 THEN 'June' WHEN 7 THEN 'July' WHEN 8 THEN 'August' WHEN 9 THEN 'September' WHEN 10 THEN 'October' WHEN 11 THEN 'November' WHEN 12 THEN 'December' END, SUM(${metric}) FROM ${table} WHERE EXTRACT(YEAR FROM ${dateColumn}) = ${year} GROUP BY 1 ${orderByClause} LIMIT ${limit}`;
+}
+
+/**
+ * Build SQL for heatmap visualizations (requires 2 categorical dimensions)
+ */
+function buildHeatmapSQL(params: Record<string, any>, query: string): string | null {
+  // Only trigger for explicit heatmap requests
+  const isHeatmap = /\bheat\s*map\b/i.test(query);
+  if (!isHeatmap) return null;
+  
+  // Heatmaps need 2 categorical dimensions + 1 numeric value
+  // Common patterns: month x shift, equipment x shift, route x shift, month x equipment
+  
+  // Check what dimensions are mentioned
+  const hasMonth = /\bmonths?\b/i.test(query);
+  const hasShift = /\bshifts?\b/i.test(query);
+  const hasEquipment = /\b(tipper|excavator|equipment|vehicle)\b/i.test(query);
+  const hasRoute = /\b(route|face)\b/i.test(query);
+  
+  // Default to month x shift if only month mentioned (most common case)
+  let dimension1 = 'month';
+  let dimension2 = 'shift';
+  
+  if (hasMonth && hasShift) {
+    dimension1 = 'month';
+    dimension2 = 'shift';
+  } else if (hasMonth && hasEquipment) {
+    dimension1 = 'month';
+    dimension2 = 'equipment';
+  } else if (hasShift && hasEquipment) {
+    dimension1 = 'shift';
+    dimension2 = 'equipment';
+  } else if (hasRoute && hasShift) {
+    dimension1 = 'route';
+    dimension2 = 'shift';
+  } else if (hasMonth) {
+    // Only month mentioned - default to month x shift
+    dimension1 = 'month';
+    dimension2 = 'shift';
+  }
+  
+  const year = params.year || getCurrentYear();
+  
+  // Build SQL based on dimensions
+  if (dimension1 === 'month' && dimension2 === 'shift') {
+    // Month x Shift heatmap from production_summary
+    return `SELECT EXTRACT(MONTH FROM date), CASE EXTRACT(MONTH FROM date) WHEN 1 THEN 'January' WHEN 2 THEN 'February' WHEN 3 THEN 'March' WHEN 4 THEN 'April' WHEN 5 THEN 'May' WHEN 6 THEN 'June' WHEN 7 THEN 'July' WHEN 8 THEN 'August' WHEN 9 THEN 'September' WHEN 10 THEN 'October' WHEN 11 THEN 'November' WHEN 12 THEN 'December' END, shift, SUM(qty_ton) FROM production_summary WHERE EXTRACT(YEAR FROM date) = ${year} GROUP BY 1, 2, 3 ORDER BY 1, 3`;
+  } else if (dimension1 === 'shift' && dimension2 === 'equipment') {
+    // Shift x Equipment heatmap from trip_summary_by_date
+    return `SELECT shift, tipper_id, SUM(qty_ton) FROM trip_summary_by_date WHERE EXTRACT(YEAR FROM trip_date) = ${year} GROUP BY 1, 2 ORDER BY shift, tipper_id`;
+  } else if (dimension1 === 'route' && dimension2 === 'shift') {
+    // Route x Shift heatmap from trip_summary_by_date
+    return `SELECT route_or_face, shift, SUM(trip_count) FROM trip_summary_by_date WHERE EXTRACT(YEAR FROM trip_date) = ${year} GROUP BY 1, 2 ORDER BY route_or_face, shift`;
+  }
+  
+  // Default fallback - month x shift
+  return `SELECT EXTRACT(MONTH FROM date), CASE EXTRACT(MONTH FROM date) WHEN 1 THEN 'January' WHEN 2 THEN 'February' WHEN 3 THEN 'March' WHEN 4 THEN 'April' WHEN 5 THEN 'May' WHEN 6 THEN 'June' WHEN 7 THEN 'July' WHEN 8 THEN 'August' WHEN 9 THEN 'September' WHEN 10 THEN 'October' WHEN 11 THEN 'November' WHEN 12 THEN 'December' END, shift, SUM(qty_ton) FROM production_summary WHERE EXTRACT(YEAR FROM date) = ${year} GROUP BY 1, 2, 3 ORDER BY 1, 3`;
+}
